@@ -6,6 +6,7 @@
 
 mod app;
 mod assets;
+mod orbit;
 mod balance;
 mod editor;
 mod game;

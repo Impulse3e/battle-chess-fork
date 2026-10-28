@@ -1215,6 +1215,9 @@ fn board_image(tiles: &[Pixels], flipped: bool) -> Pixels {
 pub struct Textures {
     scale: u32,
     boards: [TextureHandle; 2],
+    tiles: Vec<TextureHandle>,
+    /// Белый пиксель: бока клеток, тени и подсветки красятся вершинами.
+    solid: TextureHandle,
     bodies: Vec<TextureHandle>,
     gold_bodies: Vec<TextureHandle>,
     gold_shadows: Vec<TextureHandle>,
@@ -1253,6 +1256,15 @@ pub struct Textures {
 impl Textures {
     pub fn board(&self, flipped: bool) -> TextureId {
         self.boards[flipped as usize].id()
+    }
+
+    /// Верх клетки: `light` — песок, иначе трава; `variant` — 0..4, как у плоской доски.
+    pub fn tile(&self, light: bool, variant: usize) -> TextureId {
+        self.tiles[usize::from(light) * 4 + variant % 4].id()
+    }
+
+    pub fn solid(&self) -> TextureId {
+        self.solid.id()
     }
 
     pub fn body(&self, color: Color, kind: Kind) -> TextureId {
@@ -1385,6 +1397,9 @@ pub struct Art {
     /// Хитбоксы фигур (`hitbox`): какие пиксели холста ловят курсор.
     hitboxes: Vec<Vec<bool>>,
     boards: [Pixels; 2],
+    /// Клетки по отдельности: четыре тёмных варианта, потом четыре светлых.
+    /// Плоская доска собирается из них и забывает, а осмотр кладёт каждую на свой блок.
+    tiles: Vec<Pixels>,
     markers: Vec<Pixels>,
     font: Vec<Pixels>,
     cards: cards::CardArt,
@@ -1402,6 +1417,7 @@ impl Art {
     pub fn new() -> Art {
         let bodies: Vec<Pixels> = BODIES.iter().map(|png| Pixels::decode(png)).collect();
         let tiles: Vec<Pixels> = TILES.iter().map(|png| Pixels::decode(png)).collect();
+        let boards = [board_image(&tiles, false), board_image(&tiles, true)];
         Art {
             tops: bodies.iter().map(|body| body.bounds().0[1]).collect(),
             frozen: FROZEN.iter().map(|png| Pixels::decode(png)).collect(),
@@ -1488,7 +1504,8 @@ impl Art {
                 .enumerate()
                 .map(|(i, body)| hitbox(body, i % 6 == Kind::King as usize))
                 .collect(),
-            boards: [board_image(&tiles, false), board_image(&tiles, true)],
+            boards,
+            tiles,
             markers: Marker::ALL.iter().map(|m| m.image()).collect(),
             font: FONT.iter().map(|&c| glyph(c, 0xffffff, 0xb4b4b4)).collect(),
             cards: cards::CardArt::new(),
@@ -1525,6 +1542,12 @@ impl Art {
                 load(format!("board-x{scale}"), &self.boards[0]),
                 load(format!("board-flipped-x{scale}"), &self.boards[1]),
             ],
+            tiles: all("tile", &self.tiles),
+            solid: ctx.load_texture(
+                format!("solid-x{scale}"),
+                ColorImage::new([1, 1], egui::Color32::WHITE),
+                TextureOptions::NEAREST,
+            ),
             bodies: all("piece", &self.bodies),
             gold_bodies: all("gold-piece", &self.gold_bodies),
             gold_shadows: all("gold-shadow", &self.gold_shadows),

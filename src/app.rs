@@ -29,6 +29,7 @@ use crate::game::{
     Square, Status, Stock, Strike,
 };
 use crate::net;
+use crate::orbit;
 use crate::settings::{FrameRate, Settings, ZOOM_MAX, ZOOM_MIN};
 use crate::sound::{Sfx, Sound};
 use crate::theme::{self, rgba};
@@ -633,6 +634,8 @@ pub struct BattleChessApp {
     effects: Vec<Effect>,
     ended_at: Option<f64>,
     flipped: bool,
+    /// Осмотр доски с камерой вокруг объёмных клеток. Пока включён, ходы не играются.
+    orbit: Option<orbit::Orbit>,
     /// Настройки и то, что из них уже сохранено на диск.
     settings: Settings,
     saved: Settings,
@@ -755,6 +758,7 @@ impl BattleChessApp {
             effects: Vec::new(),
             ended_at: None,
             flipped: false,
+            orbit: None,
             settings,
             saved: settings,
             vsync: settings.frame_rate.vsync(),
@@ -785,6 +789,7 @@ impl BattleChessApp {
             Game::from_position(Position::rogue_start(seed).with_advance(self.settings.advance));
         self.computer = Some(Color::Black);
         self.flipped = false;
+        self.orbit = None;
         self.reset_interaction();
         let now = self.now;
         self.spark_since = now;
@@ -891,7 +896,11 @@ impl BattleChessApp {
 
     /// Кнопка «Конец хода» (или Space, Enter): соперник начинает ход с карты из колоды.
     fn end_turn(&mut self, now: f64) {
-        if self.game.is_over() || !self.game.can_end_turn() || self.aiming_card() {
+        if self.game.is_over()
+            || !self.game.can_end_turn()
+            || self.aiming_card()
+            || self.promotion.is_some()
+        {
             return;
         }
         let mover = self.game.position().side();
@@ -1566,6 +1575,7 @@ impl BattleChessApp {
         self.computer = None;
         self.remote = Some(color.opponent());
         self.flipped = color == Color::Black;
+        self.orbit = None;
         self.net_note = None;
         self.net_queue.clear();
         self.reset_interaction();
@@ -1632,20 +1642,25 @@ impl BattleChessApp {
     // ----- Мышь и клавиатура -----
 
     fn shortcuts(&mut self, ctx: &egui::Context, now: f64) {
-        let (flip, undo, fps, end) = ctx.input(|i| {
+        let (flip, undo, fps, end, look) = ctx.input(|i| {
             (
                 i.key_pressed(Key::F),
                 i.modifiers.command && i.key_pressed(Key::Z),
                 i.key_pressed(Key::F3),
                 i.key_pressed(Key::Space) || i.key_pressed(Key::Enter),
+                i.key_pressed(Key::V),
             )
         });
         // Space и Enter заканчивают ход, если клавиатура не занята полем ввода.
-        if end && self.button_active() && !ctx.wants_keyboard_input() {
+        // В осмотре ход не кончается: иначе легко закрыть его, разглядывая доску.
+        if end && self.orbit.is_none() && self.button_active() && !ctx.wants_keyboard_input() {
             self.end_turn(now);
         }
+        if look && !ctx.wants_keyboard_input() {
+            self.toggle_orbit();
+        }
         if flip {
-            self.flipped = !self.flipped;
+            self.flip_board();
         }
         if fps {
             self.settings.show_fps = !self.settings.show_fps;
@@ -1655,7 +1670,128 @@ impl BattleChessApp {
         }
     }
 
+    fn flip_board(&mut self) {
+        self.flipped = !self.flipped;
+        if let Some(orbit) = &mut self.orbit {
+            orbit.turn_around();
+        }
+    }
+
+    fn toggle_orbit(&mut self) {
+        self.drag = None;
+        self.hovered = None;
+        self.stats_for = None;
+        if self.orbit.take().is_some() {
+            return;
+        }
+        if self.holding_card() {
+            self.cancel_card(self.now);
+        }
+        self.orbit = Some(orbit::Orbit::iso(self.flipped));
+    }
+
+    /// Осмотр: мышь крутит камеру, колёсико приближает, Esc возвращает плоскую доску.
+    /// Щелчки по клеткам в этом режиме не ходят.
+    fn orbit_input(&mut self, ui: &egui::Ui, board: &BoardGeom) {
+        self.drag = None;
+        self.card_hover = None;
+        self.button_hover = false;
+        self.button_down = false;
+        self.reserve_hover = None;
+        self.shop_hover = None;
+        self.power_hover = None;
+        self.crest_hover = None;
+        self.stats_for = None;
+        self.deck_hover = None;
+        let (down, delta, esc, scroll, command, pointer) = ui.input(|i| {
+            (
+                i.pointer.primary_down() || i.pointer.secondary_down(),
+                i.pointer.delta(),
+                i.key_pressed(Key::Escape),
+                i.raw_scroll_delta.y,
+                i.modifiers.command,
+                i.pointer.latest_pos(),
+            )
+        });
+        if esc {
+            self.orbit = None;
+            self.hovered = None;
+            return;
+        }
+        let Some(orbit) = &mut self.orbit else {
+            return;
+        };
+        // Ctrl+колёсико по-прежнему меняет масштаб всего поля, а не камеру.
+        if scroll != 0.0 && !command {
+            orbit.zoom(scroll);
+        }
+        if down {
+            orbit.drag(delta);
+        }
+        let orbit = *orbit;
+        self.hovered = pointer
+            .filter(|p| board.area.contains(*p))
+            .and_then(|p| orbit.square_at(p, board.rect()));
+    }
+
+    fn orbit_marks(&self) -> orbit::Marks {
+        let over = self.game.is_over();
+        let pos = self.game.position();
+        let last = self
+            .game
+            .history()
+            .iter()
+            .rev()
+            .take_while(|r| r.turn_end().is_none_or(|t| t.planning.is_none()))
+            .find_map(|r| r.outcome());
+        let side = pos.side();
+        let king = if over { None } else { pos.king_square(side) };
+        orbit::Marks {
+            hovered: self.hovered,
+            selected: self.selected,
+            last_from: last.map(|o| o.mv.from),
+            last_to: last.map(|o| o.mv.to),
+            check: king.filter(|_| pos.in_check(side)),
+            threat: king.filter(|_| !pos.in_check(side) && pos.king_danger(side) > 0),
+        }
+    }
+
+    fn paint_orbit(&self, painter: &Painter, board: &BoardGeom, tex: &Textures) {
+        let Some(orbit) = self.orbit else {
+            return;
+        };
+        let marks = self.orbit_marks();
+        orbit::paint(
+            painter,
+            board.rect(),
+            tex,
+            orbit,
+            self.game.position(),
+            marks,
+            self.flipped,
+        );
+    }
+
+    fn paint_orbit_hint(&self, painter: &Painter, board: &BoardGeom) {
+        if self.orbit.is_none() {
+            return;
+        }
+        let text = "Мышь — крутить · колёсико — ближе · Esc — назад";
+        let galley =
+            painter.layout_no_wrap(text.to_string(), FontId::proportional(13.0), theme::TEXT_BRIGHT);
+        let rect = Rect::from_center_size(
+            pos2(board.rect().center().x, board.rect().top() + 16.0),
+            galley.size() + vec2(16.0, 8.0),
+        );
+        painter.rect_filled(rect, CornerRadius::same(4), rgba(0, 0, 0, 0.62));
+        painter.galley(rect.min + vec2(8.0, 4.0), galley, theme::TEXT_BRIGHT);
+    }
+
     fn handle_input(&mut self, ui: &egui::Ui, board: &BoardGeom, now: f64) {
+        if self.orbit.is_some() {
+            self.orbit_input(ui, board);
+            return;
+        }
         let (pressed, released, cancel, pointer) = ui.input(|i| {
             (
                 i.pointer.primary_pressed(),
@@ -1877,7 +2013,9 @@ impl BattleChessApp {
         }
 
         if self.promotion.is_some() {
-            if pressed {
+            if cancel {
+                self.promotion = None;
+            } else if pressed {
                 self.choose_promotion(now);
             }
             return;
@@ -2159,10 +2297,10 @@ impl BattleChessApp {
                 .saturating_add_signed(step)
                 .clamp(ZOOM_MIN, ZOOM_MAX);
         }
-        let fit = (avail.width() / need.x).min(avail.height() / need.y)
-            * ppp
-            * f32::from(self.settings.zoom)
-            / 100.0;
+        // Текстуры зависят только от размера окна. Масштаб из настроек их не меняет:
+        // иначе каждый щелчок колёсика заново заливает все полосы анимаций, и игра замирает.
+        let fit_at_100 = (avail.width() / need.x).min(avail.height() / need.y) * ppp;
+        let fit = fit_at_100 * f32::from(self.settings.zoom) / 100.0;
         // Пиксель арта — целое число физических пикселей, если доска от этого мельчает не
         // больше чем на 8% (сетка пикселей ровная); иначе — дробный масштаб на всё место.
         let whole = (fit + 0.01 * fit).floor();
@@ -2182,7 +2320,7 @@ impl BattleChessApp {
             area: avail,
             origin,
             scale,
-            texture_scale: physical.ceil().max(1.0) as u32,
+            texture_scale: texture_scale_for(fit_at_100),
             ppp,
             flipped: self.flipped,
         };
@@ -2191,6 +2329,7 @@ impl BattleChessApp {
 
         let textures = self.art.textures(ui.ctx(), board.texture_scale);
         self.paint_board(ui.painter(), &board, &textures, now);
+        self.paint_orbit_hint(ui.painter(), &board);
         let top = ui.ctx().layer_painter(egui::LayerId::new(
             egui::Order::Foreground,
             egui::Id::new("board-top"),
@@ -2211,6 +2350,13 @@ impl BattleChessApp {
     }
 
     fn paint_board(&self, painter: &Painter, board: &BoardGeom, tex: &Textures, now: f64) {
+        if self.orbit.is_some() {
+            self.paint_orbit(painter, board, tex);
+            self.paint_table(painter, board, tex, now);
+            self.paint_deck_count(painter, board, tex, now);
+            self.paint_banner(painter, board, now);
+            return;
+        }
         let pos = self.game.position();
         let anim = self.anim.as_ref();
 
@@ -3144,6 +3290,9 @@ impl BattleChessApp {
 
     /// Какой курсор показать: над столом он подсказывает, что будет по щелчку.
     fn pointer_kind(&self, board: &BoardGeom, pointer: Option<Pos2>) -> Pointer {
+        if self.orbit.is_some() {
+            return Pointer::Default;
+        }
         if self.holding_card() {
             return Pointer::Card;
         }
@@ -3724,7 +3873,7 @@ impl BattleChessApp {
                 .on_hover_text("Перевернуть доску (F)")
                 .clicked()
             {
-                self.flipped = !self.flipped;
+                self.flip_board();
             }
             let muted = !self.settings.sound || self.settings.volume == 0;
             let icon = if muted { "🔇" } else { "🔊" };
@@ -3750,9 +3899,31 @@ impl BattleChessApp {
             {
                 self.computer_since = None;
                 self.leave_network();
+                self.orbit = None;
                 self.screen = Screen::Menu;
             }
         });
+        let look = if self.orbit.is_some() {
+            "Закрыть осмотр"
+        } else {
+            "Осмотр доски"
+        };
+        if ui
+            .button(look)
+            .on_hover_text("Крутить доску мышью (V). Колёсико приближает, Esc — обычный вид")
+            .clicked()
+        {
+            self.toggle_orbit();
+        }
+        if self.orbit.is_some() {
+            ui.label(
+                RichText::new(
+                    "Тяните мышь, чтобы осмотреть доску. Колёсико приближает. Esc — обычный вид. Ходы в осмотре не играются.",
+                )
+                .color(theme::TEXT_DIM)
+                .size(12.0),
+            );
+        }
     }
 
     /// Rogue-like: кнопка «Выиграть раунд» — сразу победить волны этого уровня.
@@ -4171,6 +4342,18 @@ fn hex(rgb: u32) -> Color32 {
 }
 
 /// Фон под доской, как в Into the Breach: тёмно-синий, к низу темнее, по краям тень.
+/// Целый масштаб текстур по размеру окна при зуме 100%. Колёсико и ползунок
+/// масштаба доски сюда не входят: смена этого числа заново заливает весь арт.
+fn texture_scale_for(fit_at_100: f32) -> u32 {
+    let whole = (fit_at_100 + 0.01 * fit_at_100).floor();
+    let physical = if whole >= 1.0 && whole >= 0.92 * fit_at_100 {
+        whole
+    } else {
+        fit_at_100.max(0.25)
+    };
+    physical.ceil().clamp(1.0, 8.0) as u32
+}
+
 fn paint_backdrop(painter: &Painter, rect: Rect) {
     const STEPS: u32 = 12;
     let (top, bottom) = ([0x20, 0x24, 0x2f], [0x0f, 0x11, 0x17]);

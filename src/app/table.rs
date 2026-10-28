@@ -2667,7 +2667,10 @@ impl BattleChessApp {
 
     /// Кнопка работает, когда человек сходил фигурой и может закончить ход.
     pub(super) fn button_active(&self) -> bool {
-        self.human_to_move() && self.game.can_end_turn() && self.aiming.is_none()
+        self.human_to_move()
+            && self.game.can_end_turn()
+            && self.aiming.is_none()
+            && self.promotion.is_none()
     }
 
     fn button_look(&self) -> Button {

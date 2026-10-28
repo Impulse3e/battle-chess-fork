@@ -210,7 +210,9 @@ pub struct Piece {
     pub frost_touch: bool,
     /// Прибавка к атаке и к полному здоровью («Северный воин»).
     pub bonus_attack: i16,
-    pub bonus_hp: i16,
+    /// Прибавка к полному и текущему здоровью. `i32`, а не `i16`: сердца ледяных складываются,
+    /// и десятки копий уже не влезают в 16 бит.
+    pub bonus_hp: i32,
     /// Электрическая фигура (rogue-like, из магазина): урон её удара расходится молнией на
     /// чужие фигуры вокруг цели.
     pub spark: bool,
@@ -333,7 +335,7 @@ impl Piece {
         } else {
             base
         };
-        self.scaled(base + self.bonus_hp as i32)
+        self.scaled(base + self.bonus_hp)
     }
 
     /// Здоровье `hp` фигуры волны своего уровня (`tough`): × `Rule::RogueLevelHpPercent` / 100 за
@@ -4096,8 +4098,7 @@ impl Position {
     /// удар стороны, которая ходит.
     fn blast(&mut self, sq: Square, raw: i32) -> Option<WaveHit> {
         let target = self.board[sq as usize]?;
-        let damage = self.damage_at(sq, raw);
-        let (_, killed) = self.wound(sq, damage);
+        let (damage, killed) = self.wound(sq, self.damage_at(sq, raw));
         if killed {
             self.score_kill(target, self.side);
         }
@@ -4134,10 +4135,12 @@ impl Position {
     }
 
     fn burn_wave(&mut self, center: Square) -> Vec<WaveHit> {
-        let hits = self.wave_hits(center);
-        for hit in &hits {
-            self.wound(hit.square, hit.damage);
-            if hit.killed {
+        let mut hits = self.wave_hits(center);
+        for hit in &mut hits {
+            let (damage, killed) = self.wound(hit.square, hit.damage);
+            hit.damage = damage;
+            hit.killed = killed;
+            if killed {
                 self.score_kill(hit.target, self.side);
             }
         }
@@ -4255,7 +4258,7 @@ impl Position {
                 let (attack, hp) = north_bonus(self.frozen_enemies());
                 if let Some(piece) = &mut self.board[sq as usize] {
                     piece.bonus_attack = piece.bonus_attack.saturating_add(attack);
-                    piece.bonus_hp = piece.bonus_hp.saturating_add(hp);
+                    piece.bonus_hp = piece.bonus_hp.saturating_add(i32::from(hp));
                     piece.hp += i32::from(hp);
                 }
                 Vec::new()
@@ -4572,8 +4575,7 @@ impl Position {
                     let Some(target) = self.board[sq as usize].filter(|p| p.color != us) else {
                         continue;
                     };
-                    let damage = self.damage_at(sq, raw);
-                    let (_, killed) = self.wound(sq, damage);
+                    let (damage, killed) = self.wound(sq, self.damage_at(sq, raw));
                     if killed {
                         self.score_kill(target, us);
                     }
@@ -4622,8 +4624,7 @@ impl Position {
             let Some(target) = self.board[to as usize] else {
                 continue;
             };
-            let damage = self.damage_at(to, self.crater_damage[to as usize]);
-            let (_, killed) = self.wound(to, damage);
+            let (damage, killed) = self.wound(to, self.damage_at(to, self.crater_damage[to as usize]));
             if killed {
                 self.score_kill(target, r.player);
             }
@@ -4823,8 +4824,19 @@ impl Position {
             .collect()
     }
 
+    /// Карта в первый свободный слот руки, даже сверх `hand_size` — так перо отдаёт две карты
+    /// с полной руки. Дальше `ROGUE_HAND_MAX` места нет.
+    fn hold_card(&mut self, card: Card) {
+        let Some(r) = &mut self.rogue else {
+            return;
+        };
+        if let Some(free) = r.hand.iter_mut().find(|c| c.is_none()) {
+            *free = Some(card);
+        }
+    }
+
     /// Rogue-like: игрок получает вещь: фигуру — в запас, готовой; герб и медаль — до конца
-    /// забега; карту — в руку.
+    /// забега; карту — в руку (не больше `hand_size`).
     fn receive(&mut self, ware: Ware) {
         let Some(mut r) = self.rogue else {
             return;
@@ -5138,13 +5150,16 @@ impl Position {
                 self.rogue = Some(r);
             }
             Card::Feather => {
+                // Две карты, как написано на пере. Обычный добор упирается в `hand_size`, и с
+                // полной руки перо оставляло одну: карта уже ушла, свободным был один слот.
+                // Перо кладёт обе, пока рука короче `ROGUE_HAND_MAX`.
                 let mut next = self.card_random();
                 for k in 0..2 {
-                    if self.hand().len() >= hand_size() {
+                    if self.hand().len() >= ROGUE_HAND_MAX {
                         break;
                     }
                     let drawn = draw_card(&mut next, &[Card::Feather]);
-                    self.receive(Ware::Card(drawn));
+                    self.hold_card(drawn);
                     used.cards[k] = Some(drawn);
                 }
             }
@@ -5494,9 +5509,8 @@ impl Position {
                 balance().rule(Rule::RogueCrestAxeHp).clamp(0, 999) * crate::balance::POINT * axes;
             bonus = bonus.max(crate::balance::UNIT - piece.kind.stats().max_hp);
         }
-        let bonus = bonus.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
         if piece.bonus_hp != bonus {
-            piece.hp = (piece.hp + i32::from(bonus) - i32::from(piece.bonus_hp)).max(1);
+            piece.hp = (piece.hp + bonus - piece.bonus_hp).max(1);
             piece.bonus_hp = bonus;
         }
         piece
@@ -5806,8 +5820,7 @@ impl Position {
             if target.color != us && wall & 1 << sq != 0 {
                 continue;
             }
-            let damage = self.damage_at(sq, raw);
-            let (_, killed) = self.wound(sq, damage);
+            let (damage, killed) = self.wound(sq, self.damage_at(sq, raw));
             if killed {
                 self.score_kill(target, us);
             }
@@ -5868,7 +5881,12 @@ impl Position {
         let mut blasts = Vec::new();
         let mut queue = dead;
         let mut done = 0u64;
-        while let Some((sq, piece)) = queue.pop() {
+        // С начала очереди, как живые взрывы идут по очереди ударов. `pop` взрывал последний
+        // труп первым, и мульти огня усиливал не ту фигуру.
+        let mut next = 0;
+        while next < queue.len() {
+            let (sq, piece) = queue[next];
+            next += 1;
             if !piece.fire
                 || done & 1 << sq != 0
                 || self.board[sq as usize].is_some()
@@ -6008,33 +6026,9 @@ impl Position {
                     }
                     strike.again = round > 0;
                     strike.whirl = whirl;
-                    let kill = strike.hits().any(|h| h.killed);
+                    let (kill, stop) =
+                        self.finish_strike(from, attacker, sq, &mut strike, &mut fed, &mut done);
                     killed |= kill;
-                    let fangs = self.crest_times(us, Crest::AxeFangs);
-                    if kill
-                        && !fed
-                        && attacker.barbarian
-                        && fangs > 0
-                        && let Some(me) = &mut self.board[from as usize]
-                    {
-                        fed = true;
-                        let heal = (balance().rule(Rule::RogueCrestFangsHeal).clamp(0, 999)
-                            * crate::balance::POINT
-                            * fangs)
-                            .min(me.max_hp() - me.hp)
-                            .max(0);
-                        me.hp += heal;
-                        strike.feast += heal;
-                    }
-                    let advance = self.advance
-                        && strike.hit.killed
-                        && close_strike(attacker.kind, from, sq)
-                        && self.board[sq as usize].is_none();
-                    if advance {
-                        self.advance_to(from, &mut strike);
-                        done |= 1 << sq;
-                    }
-                    let stop = advance || strike.rebound || self.board[from as usize].is_none();
                     strikes.push(strike);
                     if stop {
                         break 'rounds;
@@ -6053,8 +6047,9 @@ impl Position {
                     let target = self.board[sq as usize].expect("чужая фигура");
                     let mut strike = self.strike(from, me, sq, target, wall);
                     strike.again = true;
-                    killed |= strike.hits().any(|h| h.killed);
-                    let stop = strike.rebound || self.board[from as usize].is_none();
+                    let (kill, stop) =
+                        self.finish_strike(from, me, sq, &mut strike, &mut fed, &mut done);
+                    killed |= kill;
                     strikes.push(strike);
                     if stop {
                         break 'rounds;
@@ -6071,6 +6066,47 @@ impl Position {
             self.halfmove_clock = 0;
         }
         strikes
+    }
+
+    /// После удара: лечение «топора и клыков» и перемещение при взятии. Возвращает, было ли
+    /// убийство и надо ли этому атакующему остановиться. Общее для обычного удара и второго
+    /// удара «ветра и меча».
+    fn finish_strike(
+        &mut self,
+        from: Square,
+        attacker: Piece,
+        sq: Square,
+        strike: &mut Strike,
+        fed: &mut bool,
+        done: &mut u64,
+    ) -> (bool, bool) {
+        let kill = strike.hits().any(|h| h.killed);
+        let fangs = self.crest_times(attacker.color, Crest::AxeFangs);
+        if kill
+            && !*fed
+            && attacker.barbarian
+            && fangs > 0
+            && let Some(me) = &mut self.board[from as usize]
+        {
+            *fed = true;
+            let heal = (balance().rule(Rule::RogueCrestFangsHeal).clamp(0, 999)
+                * crate::balance::POINT
+                * fangs)
+                .min(me.max_hp() - me.hp)
+                .max(0);
+            me.hp += heal;
+            strike.feast += heal;
+        }
+        let advance = self.advance
+            && strike.hit.killed
+            && close_strike(attacker.kind, from, sq)
+            && self.board[sq as usize].is_none();
+        if advance {
+            self.advance_to(from, strike);
+            *done |= 1 << sq;
+        }
+        let stop = advance || strike.rebound || self.board[from as usize].is_none();
+        (kill, stop)
     }
 
     /// Сколько раз подряд варвар на `from` может ударить ещё раз после убийства:
@@ -6577,23 +6613,10 @@ impl Position {
             swap = Some((other, target));
             target = self.board[sq as usize].expect("обычная фигура");
         }
-        let mut damage = if dodged { 0 } else { self.damage_at(sq, raw) };
-        // Герб замороженной снежинки: ледяная фигура во льду урона не получает, а удар, после
-        // которого у неё осталось бы `Rule::RogueCrestCrystalHp` здоровья или меньше, оставляет
-        // ровно столько — и она вмерзает в лёд до конца этого хода соперника: оттаивает к
-        // своему ходу и может ходить (с 0.78, просьба пользователя).
-        let mut encased = false;
-        if target.icy && self.crest_for(target.color, Crest::Crystal) {
-            let floor =
-                balance().rule(Rule::RogueCrestCrystalHp).clamp(1, 999) * crate::balance::POINT;
-            if target.is_frozen() {
-                damage = 0;
-            } else if target.hp > floor && target.hp - damage <= floor {
-                damage = target.hp - floor;
-                encased = true;
-            }
-        }
-        let (_, killed) = self.wound(sq, damage);
+        // Замороженная снежинка — в `wound`: ноль урона во льду и вмерзание на пороге здоровья.
+        let was_frozen = self.board[sq as usize].is_some_and(|p| p.is_frozen());
+        let (damage, killed) = self.wound(sq, if dodged { 0 } else { self.damage_at(sq, raw) });
+        let encased = !was_frozen && self.board[sq as usize].is_some_and(|p| p.is_frozen());
         // Ядовитая фигура отравляет выжившую цель (уже отравленную — нет): урон яда — в конце
         // следующего хода цели (бьют в ход соперника — в конце её ближайшего хода, в её ход —
         // в конце следующего).
@@ -6606,8 +6629,7 @@ impl Position {
             piece.poison = if self.side == piece.color { 2 } else { 1 };
             poisoned = true;
         }
-        if encased && let Some(piece) = &mut self.board[sq as usize] {
-            piece.frozen = piece.frozen.max(1);
+        if encased {
             chilled = true;
         }
         // Вампир восстанавливает здоровье за каждый удар по чужой фигуре, вампир в броне — только
@@ -6723,8 +6745,7 @@ impl Position {
                         continue;
                     };
                     seen |= 1 << s;
-                    let damage = self.damage_at(s, spread(self, depth));
-                    let (_, dead) = self.wound(s, damage);
+                    let (damage, dead) = self.wound(s, self.damage_at(s, spread(self, depth)));
                     if dead {
                         self.score_kill(victim, us);
                     }
@@ -7482,16 +7503,42 @@ impl Position {
     }
 
     /// Наносит урон фигуре на `sq`: возвращает, сколько урона прошло, и погибла ли она.
+    /// Урон с гербом замороженной снежинки: уже вмёрзшая ледяная фигура не теряет здоровье,
+    /// а удар, после которого осталось бы не больше `Rule::RogueCrestCrystalHp`, оставляет
+    /// ровно столько и вмораживает её. Так бьют и удар, и взрыв, и метеорит, и яд.
+    fn crystal_adjust(&self, sq: Square, dealt: i32) -> (i32, bool) {
+        let Some(target) = self.board[sq as usize] else {
+            return (dealt, false);
+        };
+        if !(target.icy && self.crest_for(target.color, Crest::Crystal)) {
+            return (dealt, false);
+        }
+        let floor =
+            balance().rule(Rule::RogueCrestCrystalHp).clamp(1, 999) * crate::balance::POINT;
+        if target.is_frozen() {
+            (0, false)
+        } else if target.hp > floor && target.hp - dealt <= floor {
+            (target.hp - floor, true)
+        } else {
+            (dealt, false)
+        }
+    }
+
     fn wound(&mut self, sq: Square, dealt: i32) -> (i32, bool) {
         let Some(piece) = self.board[sq as usize] else {
             return (0, false);
         };
+        let (dealt, encased) = self.crystal_adjust(sq, dealt);
         let hp = piece.hp - dealt;
         let killed = hp <= 0;
         if killed {
             self.fall(sq, piece);
         } else {
-            self.board[sq as usize] = Some(Piece { hp, ..piece });
+            let mut piece = Piece { hp, ..piece };
+            if encased {
+                piece.frozen = piece.frozen.max(1);
+            }
+            self.board[sq as usize] = Some(piece);
         }
         (dealt, killed)
     }

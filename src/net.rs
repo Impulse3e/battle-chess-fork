@@ -159,15 +159,28 @@ fn heartbeat(writer: Arc<Mutex<Option<TcpStream>>>) {
     }
 }
 
+/// Адрес с портом. Без порта — `DEFAULT_PORT`. IPv6 (`::1`, `[::1]`) тоже: двоеточие в нём
+/// само по себе порт не означает. `[::1]:47900` и `127.0.0.1:47900` не меняются.
+fn with_default_port(address: &str) -> String {
+    if let Some(rest) = address.strip_prefix('[') {
+        if address.contains("]:") {
+            return address.to_owned();
+        }
+        let host = rest.strip_suffix(']').unwrap_or(rest);
+        return format!("[{host}]:{DEFAULT_PORT}");
+    }
+    match address.matches(':').count() {
+        0 => format!("{address}:{DEFAULT_PORT}"),
+        1 => address.to_owned(),
+        _ => format!("[{address}]:{DEFAULT_PORT}"),
+    }
+}
+
 fn open(address: &str) -> Result<TcpStream, String> {
     if address.is_empty() {
         return Err("введите адрес сервера".into());
     }
-    let full = if address.contains(':') {
-        address.to_owned()
-    } else {
-        format!("{address}:{DEFAULT_PORT}")
-    };
+    let full = with_default_port(address);
     let addrs: Vec<_> = full
         .to_socket_addrs()
         .map_err(|e| format!("адрес «{address}» не разобрать: {e}"))?
@@ -312,6 +325,16 @@ mod tests {
             assert_eq!(parse_rules(&rules_line(advance)), Some(advance));
         }
         assert_eq!(parse_rules("RULES что-то"), None);
+    }
+
+    #[test]
+    fn an_address_without_a_port_gets_the_default_including_ipv6() {
+        assert_eq!(with_default_port("127.0.0.1"), "127.0.0.1:47900");
+        assert_eq!(with_default_port("127.0.0.1:14888"), "127.0.0.1:14888");
+        assert_eq!(with_default_port("localhost"), "localhost:47900");
+        assert_eq!(with_default_port("::1"), "[::1]:47900");
+        assert_eq!(with_default_port("[::1]"), "[::1]:47900");
+        assert_eq!(with_default_port("[::1]:47900"), "[::1]:47900");
     }
 
     /// Две игры через настоящий сервер играют одну партию случайными ходами: после каждого

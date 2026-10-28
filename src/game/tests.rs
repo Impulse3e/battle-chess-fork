@@ -3721,6 +3721,20 @@ fn rogue_like_heart_crest_gives_ice_pieces_more_health() {
 }
 
 #[test]
+fn heart_crests_keep_adding_health_past_a_16_bit_cap() {
+    let hearts = 60;
+    let pos = crest_position(&vec![Crest::Heart; hearts], Color::White);
+    let knight = pos.crested(ice(Kind::Knight));
+    let point = crate::balance::POINT;
+    let heart = balance().rule(Rule::RogueCrestHeartHp) * point;
+    let ice_hp = balance().rule(Rule::RogueIceHp) * point;
+    let knight_bonus = rogue_knight_hp() - Kind::Knight.stats().max_hp;
+    let expect = knight_bonus + ice_hp + heart * hearts as i32;
+    assert!(expect > i32::from(i16::MAX), "это уже не влезает в i16");
+    assert_eq!(knight.bonus_hp, expect);
+}
+
+#[test]
 fn rogue_like_snow_crest_freezes_attackers_for_two_turns() {
     for (crests, frozen) in [(&[][..], 3), (&[Crest::Snow2][..], 5)] {
         let mut pos = crest_position(crests, Color::Black);
@@ -3753,6 +3767,10 @@ fn rogue_like_crystal_crest_encases_ice_pieces_at_one_health() {
     let knight = pos.piece(sq("e4")).unwrap();
     assert_eq!(knight.hp, unit);
     assert_eq!(knight.frozen, 1, "оттает в конце этого хода");
+    // Взрыв и прямой урон — тоже: во льду здоровье не падает.
+    let (dealt, killed) = pos.wound(sq("e4"), 5 * unit);
+    assert_eq!((dealt, killed), (0, false));
+    assert_eq!(pos.piece(sq("e4")).unwrap().hp, unit);
     // По коню с одной единицей удар смертелен.
     let mut pos = crest_position(&[Crest::Crystal], Color::Black);
     pos.board[sq("e4") as usize] = Some(Piece {
@@ -3853,7 +3871,7 @@ fn rogue_like_poison_hurts_at_the_end_of_the_next_turn() {
     let mut pos = crest_position(&[], Color::White);
     pos.board[sq("e4") as usize] = Some(Piece {
         hp: full,
-        bonus_hp: 3 * unit as i16,
+        bonus_hp: 3 * unit,
         ..Piece::new(Kind::Knight, Color::White)
     });
     // Две ядовитые пешки бьют коня — яд не копится.
@@ -4254,6 +4272,28 @@ fn rogue_like_flame_skull_crest_blows_up_the_fallen() {
     // Без герба — просто погиб.
     let mut pos = setup(&[]);
     assert!(pos.end_turn().blasts.iter().all(|b| b.center != sq("e4")));
+}
+
+#[test]
+fn fallen_fire_pieces_explode_in_the_order_they_died() {
+    let unit = crate::balance::UNIT;
+    let mut pos = crest_position(&[Crest::FlameSkull], Color::Black);
+    // Пешка d5 бьёт c4 раньше e4 (очередь ударов — слева направо).
+    for name in ["c4", "e4"] {
+        pos.board[sq(name) as usize] = Some(Piece {
+            hp: unit,
+            ..fire(Kind::Knight)
+        });
+    }
+    pos.board[sq("d5") as usize] = Some(pawn_with(5 * unit));
+    let centers: Vec<Square> = pos
+        .end_turn()
+        .blasts
+        .iter()
+        .map(|b| b.center)
+        .filter(|&center| center == sq("c4") || center == sq("e4"))
+        .collect();
+    assert_eq!(centers, vec![sq("c4"), sq("e4")]);
 }
 
 fn shade(kind: Kind, hp: i32) -> Piece {
@@ -4727,6 +4767,42 @@ fn rogue_like_wind_sword_crest_strikes_one_target_twice() {
     let double = strikes(&[Crest::WindSword]);
     assert_eq!(double.len(), 3);
     assert_eq!(double[2], (double[0].0, true), "первая цель — ещё раз");
+}
+
+#[test]
+fn rogue_like_wind_sword_follow_up_heals_and_advances() {
+    let unit = crate::balance::UNIT;
+    let heal = balance().rule(Rule::RogueCrestFangsHeal) * crate::balance::POINT;
+    let mut knight = Piece {
+        wind: true,
+        barbarian: true,
+        ..Piece::new(Kind::Knight, Color::White)
+    };
+    knight.hp -= heal;
+    let wounded = knight.hp;
+    let mut pos = crest_position(&[Crest::WindSword, Crest::AxeFangs], Color::White);
+    pos.board[sq("e4") as usize] = Some(knight);
+    // Первый удар ранит, второй — добивает. Лечение только с добивания.
+    pos.board[sq("d6") as usize] = Some(pawn_with(2 * unit));
+    let strikes = pos.strike_all();
+    let follow = strikes.iter().find(|s| s.again).unwrap();
+    assert!(follow.hit.killed);
+    assert_eq!(follow.feast, heal);
+    assert_eq!(pos.piece(sq("e4")).unwrap().hp, wounded + heal);
+
+    let mut pos = crest_position(&[Crest::WindSword], Color::White).with_advance(true);
+    pos.board[sq("e4") as usize] = Some(Piece {
+        wind: true,
+        ..Piece::new(Kind::Knight, Color::White)
+    });
+    pos.board[sq("d6") as usize] = Some(pawn_with(2 * unit));
+    pos.strike_all();
+    assert!(pos.piece(sq("e4")).is_none(), "после добивания уходит с клетки");
+    assert_eq!(
+        pos.piece(sq("d6")).map(|p| p.kind),
+        Some(Kind::Knight),
+        "встаёт на клетку второй, добивающей атаки"
+    );
 }
 
 /// Белый электрический конь e4 бьёт пешку d6 (здоровья много); `setup` — ещё чужие фигуры.
@@ -6178,6 +6254,20 @@ fn rogue_like_new_cards_work() {
     // Отмена возвращает руку.
     assert!(game.undo());
     assert_eq!(game.position().hand(), vec![Card::Feather]);
+    // Полная рука: перо уходит, и всё равно приходят две карты, не одна.
+    game.position.rogue.as_mut().unwrap().hand = [
+        Some(Card::Feather),
+        Some(Card::Coin),
+        Some(Card::Double),
+        None,
+        None,
+    ];
+    assert!(game.use_card(0, &[]));
+    let full = game.position().hand();
+    assert_eq!(full.len(), 4, "{full:?}");
+    assert!(!full.contains(&Card::Feather));
+    assert!(full.contains(&Card::Coin) && full.contains(&Card::Double));
+    assert!(game.undo());
 
     // Монета: золото — сколько стоит всё, что можно продать (запас, гербы и карты в руке — сама
     // монета уходит из руки раньше).
