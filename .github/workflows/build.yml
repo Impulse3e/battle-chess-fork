@@ -1,0 +1,59 @@
+# Release-сборка Windows. Exe самодостаточный: картинки и звуки вшиты в бинарник.
+# Скачать: вкладка Actions у прогона → Artifacts.
+# Тег v* дополнительно публикует тот же файл в релизе GitHub.
+
+name: Сборка exe
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Windows exe
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Код
+        uses: actions/checkout@v4
+
+      # Тот же тулчейн, что у локальной сборки: rustup GNU без Visual Studio.
+      # build.rs сам находит System32, отдельный MinGW не нужен.
+      - name: Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-x86_64-pc-windows-gnu
+
+      - name: Кэш
+        uses: Swatinem/rust-cache@v2
+
+      - name: Сборка
+        run: cargo build --release
+
+      - name: Имя по версии
+        id: ver
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          cp target/release/battle-chess.exe "battle-chess-${version}-windows.exe"
+
+      - name: Exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: battle-chess-${{ steps.ver.outputs.version }}-windows
+          path: battle-chess-*-windows.exe
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Релиз
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: battle-chess-*-windows.exe
