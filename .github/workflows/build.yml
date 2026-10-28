@@ -1,13 +1,12 @@
 # Release-сборка Windows. Exe самодостаточный: картинки и звуки вшиты в бинарник.
-# Скачать: вкладка Actions у прогона → Artifacts.
-# Тег v* дополнительно публикует тот же файл в релизе GitHub.
+# После пуша в main файл появляется в списке релизов: v<версия из Cargo.toml>.
+# Повторный пуш той же версии заменяет exe в том же релизе.
 
 name: Сборка exe
 
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   workflow_dispatch:
 
 env:
@@ -63,7 +62,12 @@ jobs:
           retention-days: 90
 
       - name: Релиз
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: battle-chess-*-windows.exe
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: Боевые шахматы ${{ steps.ver.outputs.version }}
+          body: Файл для Windows — battle-chess-${{ steps.ver.outputs.version }}-windows.exe
+          files: battle-chess-${{ steps.ver.outputs.version }}-windows.exe
+          overwrite_files: true
+          make_latest: true
+          fail_on_unmatched_files: true
