@@ -23,18 +23,28 @@ jobs:
       - name: Код
         uses: actions/checkout@v4
 
-      # Тот же тулчейн, что у локальной сборки: rustup GNU без Visual Studio.
-      # build.rs сам находит System32, отдельный MinGW не нужен.
+      # На машине GitHub стоит Visual Studio, её линкер и собирает exe.
+      # GNU-тулчейн rustup там берёт чужой gcc из Git for Windows и падает на линковке.
+      # Локальная сборка без Visual Studio остаётся на GNU.
       - name: Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable-x86_64-pc-windows-gnu
 
       - name: Кэш
         uses: Swatinem/rust-cache@v2
 
       - name: Сборка
-        run: cargo build --release
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo build --release 2>&1 | tee build.log
+
+      - name: Лог сборки
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
 
       - name: Имя по версии
         id: ver
